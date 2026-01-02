@@ -1,8 +1,7 @@
-name: Build FreeBSD Release
+name: Build FreeBSD Manual
 
 permissions:
   contents: write
-  packages: write
 
 on:
   workflow_dispatch:
@@ -27,30 +26,43 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install FPM (Required for FreeBSD packaging)
+      - name: Install FPM
         run: |
           sudo apt-get update
           sudo apt-get install -y ruby ruby-dev rubygems build-essential
           sudo gem install fpm
 
       - name: Build FreeBSD Package
-        # This creates the FreeBSD .pkg or .sh installer
         run: npx electron-builder --linux freebsd --x64
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract ASAR for Native Use
-        # This provides a fallback for native FreeBSD users
+      - name: Prepare Artifacts
         run: |
-          mkdir -p dist/native
-          cp dist/linux-unpacked/resources/app.asar dist/native/vacuumtube.asar
+          mkdir -p output/
+          cp dist/*.pkg output/ 2>/dev/null || true
+          cp dist/*.sh output/ 2>/dev/null || true
+          # Note: ensure path matches where electron-builder puts the asar
+          cp dist/linux-unpacked/resources/app.asar output/vacuumtube.asar 2>/dev/null || true
 
-      - name: Upload FreeBSD artifacts
+      - name: Upload Artifacts to Actions Summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vacuumtube-freebsd
+          path: output/
+
+      - name: Upload to Release
+        # Only run this if we are actually on a release OR if a tag exists
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         run: |
-          # Upload the installer package
-          gh release upload ${{ github.event.release.tag_name }} dist/*.pkg --clobber || true
-          gh release upload ${{ github.event.release.tag_name }} dist/*.sh --clobber || true
-          # Upload the raw ASAR for native FreeBSD Electron execution
-          gh release upload ${{ github.event.release.tag_name }} dist/native/vacuumtube.asar --clobber
+          # Use the tag from the event, or the current ref if triggered manually on a tag
+          TAG=${{ github.event.release.tag_name || github.ref_name }}
+          
+          # Upload all files found in the output directory
+          for file in output/*; do
+            if [ -f "$file" ]; then
+              gh release upload "$TAG" "$file" --clobber
+            fi
+          done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
