@@ -1,4 +1,4 @@
-name: Build FreeBSD Native
+name: Build Standalone FreeBSD Package
 
 permissions:
   contents: write
@@ -9,9 +9,9 @@ on:
     types: [created]
 
 jobs:
-  build-freebsd:
+  build-freebsd-standalone:
     runs-on: ubuntu-latest
-    name: Build Native FreeBSD Package
+    name: Package Standalone FreeBSD
     
     steps:
       - name: Checkout code
@@ -24,68 +24,69 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          npm ci
+          npm install -g asar
 
-      - name: Install FPM (Packaging Tool)
+      - name: Install FPM and Archive Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ruby ruby-dev rubygems build-essential
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential libarchive-tools
           sudo gem install fpm
 
-      - name: Build Electron Assets
-        # We build 'unpacked' to generate the app.asar without bundling the Linux binary
-        run: npx electron-builder --linux dir --x64
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Native FreeBSD .pkg from ASAR
+      - name: Fetch FreeBSD Native Electron Binary
         run: |
-          # 1. Setup the FreeBSD directory structure
-          mkdir -p fakedest/usr/local/share/vacuumtube
+          mkdir -p native-electron
+          # We fetch the official FreeBSD package for Electron
+          # Adjust the version/URL based on the latest available FreeBSD 14/13 pkg
+          curl -L http://pkg.freebsd.org/FreeBSD:14:amd64/latest/All/electron30-30.0.9.pkg -o electron.pkg
+          # Extract the contents of the .pkg (which is a zstd compressed ustar)
+          tar -xf electron.pkg -C native-electron
+          # The binary usually ends up in usr/local/share/electron30/
+
+      - name: Assemble Standalone Bundle
+        run: |
+          mkdir -p fakedest/usr/local/opt/vacuumtube
           mkdir -p fakedest/usr/local/bin
           mkdir -p output/
 
-          # 2. Copy the ASAR (the heart of the app)
-          cp dist/linux-unpacked/resources/app.asar fakedest/usr/local/share/vacuumtube/app.asar
+          # 1. Copy the extracted FreeBSD Electron files into our app folder
+          # This makes the app self-contained
+          cp -R native-electron/usr/local/share/electron30/* fakedest/usr/local/opt/vacuumtube/
 
-          # 3. Create a universal launch script for FreeBSD
+          # 2. Build and Inject the ASAR
+          asar pack . fakedest/usr/local/opt/vacuumtube/resources/app.asar --unpack-dir "{node_modules/electron,node_modules/electron-builder,.git}"
+
+          # 3. Create the direct Launcher
+          # This points to the bundled electron binary inside the same folder
           cat << 'EOF' > fakedest/usr/local/bin/vacuumtube
           #!/bin/sh
-          # Search for available native Electron versions on FreeBSD
-          ELECTRON=$(which electron30 || which electron29 || which electron)
-          if [ -z "$ELECTRON" ]; then
-            echo "Error: Native Electron not found."
-            echo "Please install it using: sudo pkg install electron30"
-            exit 1
-          fi
-          exec "$ELECTRON" /usr/local/share/vacuumtube/app.asar "$@"
+          export DIRECTORY="/usr/local/opt/vacuumtube"
+          exec "$DIRECTORY/electron" "$DIRECTORY/resources/app.asar" "$@"
           EOF
-          
           chmod +x fakedest/usr/local/bin/vacuumtube
 
-          # 4. Use FPM to build the native FreeBSD .pkg
-          # This package is tiny because it doesn't include the browser engine
+      - name: Build Standalone .pkg with FPM
+        run: |
           fpm -s dir -t freebsd \
-            -n vacuumtube \
+            -n vacuumtube-standalone \
             -v ${{ github.event.release.tag_name || '1.0.0' }} \
             -C fakedest \
-            --depends electron30 \
-            --description "VacuumTube YouTube Leanback Client (Native FreeBSD)" \
+            --description "Standalone VacuumTube (Includes Electron Runtime)" \
             --prefix / \
-            -p output/vacuumtube-native-freebsd.pkg
-
-      - name: Upload Artifacts to Actions
-        uses: actions/upload-artifact@v4
-        with:
-          name: vacuumtube-freebsd-native
-          path: output/
+            -p output/vacuumtube-standalone-freebsd.pkg
 
       - name: Upload to Release
         if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         run: |
           TAG=${{ github.event.release.tag_name || github.ref_name }}
-          # Upload the native package and the raw asar for flexibility
-          gh release upload "$TAG" output/vacuumtube-native-freebsd.pkg --clobber
-          gh release upload "$TAG" fakedest/usr/local/share/vacuumtube/app.asar --clobber
+          gh release upload "$TAG" output/vacuumtube-standalone-freebsd.pkg --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vacuumtube-standalone-pkg
+          path: output/vacuumtube-standalone-freebsd.pkg
